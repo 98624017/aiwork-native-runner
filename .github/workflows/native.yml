@@ -1,0 +1,217 @@
+name: Native handoff validation
+run-name: native-${{ inputs.dispatch_id }}-${{ inputs.capsule_sha256 }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_id:
+        description: Unique operation UUID
+        required: true
+        type: string
+      use_cache:
+        description: Reuse verified public third-party downloads
+        required: false
+        default: true
+        type: boolean
+      candidate_revision:
+        description: Exact encrypted snapshot revision
+        required: true
+        type: string
+      capsule_sha256:
+        description: SHA-256 of candidate.capsule
+        required: true
+        type: string
+      targets:
+        description: all or a comma-separated subset of windows-x64,macos-arm64,macos-x64
+        required: true
+        default: all
+        type: string
+      export_updates:
+        description: Also export canonical automatic-update assets after native validation
+        required: false
+        default: false
+        type: boolean
+      registry_pressure:
+        description: Run native database contention and packaged restart stress tests
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.actor == github.repository_owner && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && inputs.targets != 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Validate requested native targets
+        id: targets
+        shell: bash
+        env:
+          REQUESTED_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          matrix=$(node capsule.mjs plan --targets "$REQUESTED_TARGETS")
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+  native:
+    name: native-${{ matrix.target }}
+    if: >-
+      !cancelled() && github.actor == github.repository_owner &&
+      github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' &&
+      ((inputs.targets == 'all' && needs.plan.result == 'skipped') || needs.plan.result == 'success')
+    needs: plan
+    concurrency:
+      group: native-handoff-${{ inputs.dispatch_id }}-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: >-
+        ${{ fromJSON(inputs.targets == 'all' &&
+        '{"include":[{"target":"windows-x64","platform":"win32","arch":"x64","runner":"windows-2022"},{"target":"macos-arm64","platform":"darwin","arch":"arm64","runner":"macos-15"},{"target":"macos-x64","platform":"darwin","arch":"x64","runner":"macos-15-intel"}]}'
+        || needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      NATIVE_TARGET_PLATFORM: ${{ matrix.platform }}
+      NATIVE_TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Check requested targets before opening candidate
+        shell: bash
+        env:
+          REQUESTED_TARGETS: ${{ inputs.targets }}
+        run: node capsule.mjs plan --targets "$REQUESTED_TARGETS"
+      - name: Fetch and verify the immutable encrypted candidate
+        id: admit
+        shell: bash
+        env:
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: |
+          set -euo pipefail
+          node capsule.mjs fetch --expected-sha256 "$CAPSULE_SHA256" --dispatch-id "$DISPATCH_ID" --output "$RUNNER_TEMP/candidate.capsule" >> "$GITHUB_OUTPUT"
+      - name: Authenticate and open candidate
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets[steps.admit.outputs.key_name] }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$CAPSULE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$CANDIDATE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          node -e 'const assert = require("node:assert/strict"); assert.match(process.version, /^v22\./); assert.equal(process.platform, process.env.NATIVE_TARGET_PLATFORM); assert.equal(process.arch, process.env.NATIVE_TARGET_ARCH);'
+          printf '%s' "$CAPSULE_KEY" | node capsule.mjs open --bundle "$RUNNER_TEMP/candidate.capsule" --output "$RUNNER_TEMP/candidate.bundle" --expected-sha256 "$CAPSULE_SHA256"
+          unset CAPSULE_KEY
+          git clone --quiet --branch main --config core.autocrlf=false "$RUNNER_TEMP/candidate.bundle" "$RUNNER_TEMP/candidate" 2> "$RUNNER_TEMP/private-clone.log"
+          test "$(git -C "$RUNNER_TEMP/candidate" rev-parse HEAD)" = "$CANDIDATE_REVISION"
+      - name: Identify pinned public dependency downloads
+        id: cache_id
+        if: inputs.use_cache
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module -e 'import {createHash} from "node:crypto"; import {readFileSync} from "node:fs"; import path from "node:path"; const prefix = "public-downloads-v1-" + process.platform + "-" + process.arch + "-"; const hash = createHash("sha256"); for (const name of ["pnpm-lock.yaml", "Cargo.lock", "rust-toolchain.toml"]) hash.update(createHash("sha256").update(readFileSync(path.join(process.env.RUNNER_TEMP, "candidate", name))).digest()); hash.update(process.version); console.log("prefix=" + prefix + "\nkey=" + prefix + hash.digest("hex"));' >> "$GITHUB_OUTPUT"
+      - name: Restore public downloads
+        id: restore_cache
+        if: inputs.use_cache && steps.cache_id.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/public-downloads-transport
+          key: ${{ steps.cache_id.outputs.key }}
+          restore-keys: ${{ steps.cache_id.outputs.prefix }}
+      - name: Build protected candidate and validate native lifecycle
+        id: validate
+        timeout-minutes: 40
+        shell: bash
+        env:
+          NATIVE_CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+          NATIVE_CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          NATIVE_PUBLIC_DOWNLOAD_CACHE: ${{ inputs.use_cache && steps.cache_id.outcome == 'success' && 'true' || 'false' }}
+          NATIVE_EXPORT_UPDATES: ${{ inputs.export_updates }}
+          NATIVE_REGISTRY_PRESSURE: ${{ inputs.registry_pressure }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export NATIVE_REPORT_DIRECTORY="$RUNNER_TEMP/public-report"
+          export NATIVE_PRIVATE_LOG_PATH="$RUNNER_TEMP/private-validation.log"
+          node "$RUNNER_TEMP/candidate/scripts/generation-handoff-validation/native-run.mjs" >> "$NATIVE_PRIVATE_LOG_PATH" 2>&1
+      - name: Prepare verified public downloads for caching
+        id: export_cache
+        if: success() && inputs.use_cache && steps.cache_id.outcome == 'success' && steps.restore_cache.outputs.cache-hit != 'true' && steps.validate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          NATIVE_PUBLIC_DOWNLOAD_CACHE: 'true'
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/candidate/scripts/generation-handoff-validation/public-cache.mjs" export >> "$RUNNER_TEMP/private-validation.log" 2>&1
+      - name: Encrypt private failure log
+        if: always() && steps.admit.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets[steps.admit.outputs.key_name] }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -f "$RUNNER_TEMP/private-validation.log" ]]; then
+            node --input-type=module -e 'import { readFileSync } from "node:fs"; import path from "node:path"; import { openCapsule } from "./capsule.mjs"; try { openCapsule(readFileSync(path.join(process.env.RUNNER_TEMP, "candidate.capsule")), process.env.CAPSULE_KEY.trim(), process.env.CAPSULE_SHA256); } catch { console.error("Private log capsule key does not match the dispatched candidate"); process.exit(1); }'
+            mkdir -p "$RUNNER_TEMP/public-report"
+            printf '%s' "$CAPSULE_KEY" | node capsule.mjs seal-with-key --bundle "$RUNNER_TEMP/private-validation.log" --output "$RUNNER_TEMP/public-report/private-log.capsule"
+          fi
+      - name: Upload exact verified installer, sanitized report and encrypted private log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-handoff-${{ matrix.target }}
+          path: |
+            ${{ steps.validate.outcome == 'success' && steps.validate.outputs.installer_path || '' }}
+            ${{ inputs.export_updates && steps.validate.outcome == 'success' && steps.validate.outputs.update_paths || '' }}
+            ${{ runner.temp }}/public-report/native-handoff.json
+            ${{ runner.temp }}/public-report/private-log.capsule
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Remove private candidate and plaintext logs
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { rm } from "node:fs/promises"; import path from "node:path"; const root = process.env.RUNNER_TEMP; if (!root || !path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root) throw new Error("Missing runner temp"); for (const name of ["candidate", "candidate.capsule", "candidate.bundle", "private-clone.log", "private-validation.log", "native-download-cache-work"]) await rm(path.join(root, name), { recursive: name === "candidate" || name === "native-download-cache-work", force: true });'
+      - name: Save verified public downloads
+        if: success() && inputs.use_cache && steps.export_cache.outcome == 'success' && steps.validate.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/public-downloads-transport
+          key: ${{ steps.cache_id.outputs.key }}
+      - name: Remove public cache staging
+        if: always()
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { rm } from "node:fs/promises"; import path from "node:path"; const root = process.env.RUNNER_TEMP; if (!root || !path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root) throw new Error("Missing runner temp"); await rm(path.join(root, "public-downloads-transport"), { recursive: true, force: true });'
