@@ -180,7 +180,7 @@ jobs:
           set -euo pipefail
           umask 077
           if [[ -f "$RUNNER_TEMP/private-validation.log" ]]; then
-            node --input-type=module -e 'import { readFileSync } from "node:fs"; import path from "node:path"; import { openCapsule } from "./capsule.mjs"; try { openCapsule(readFileSync(path.join(process.env.RUNNER_TEMP, "candidate.capsule")), process.env.CAPSULE_KEY.trim(), process.env.CAPSULE_SHA256); } catch { console.error("Private log capsule key does not match the dispatched candidate"); process.exit(1); }'
+            printf '%s' "$CAPSULE_KEY" | node --input-type=module -e 'import { readFileSync } from "node:fs"; import path from "node:path"; import { openCapsule } from "./capsule.mjs"; try { openCapsule(readFileSync(path.join(process.env.RUNNER_TEMP, "candidate.capsule")), readFileSync(0, "utf8").trim(), process.env.CAPSULE_SHA256); } catch { console.error("Private log capsule key does not match the dispatched candidate"); process.exit(1); }'
             mkdir -p "$RUNNER_TEMP/public-report"
             printf '%s' "$CAPSULE_KEY" | node capsule.mjs seal-with-key --bundle "$RUNNER_TEMP/private-validation.log" --output "$RUNNER_TEMP/public-report/private-log.capsule"
           fi
